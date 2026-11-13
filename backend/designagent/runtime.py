@@ -172,6 +172,9 @@ class Runtime:
         interface, error = await _make_orbit(settings)
         self.orbit_error = error
         self.orbit = interface
+        # A refused connect is a notice, not a dead process. The next design
+        # round reads this; chat does not repeat it.
+        self.manager.hpc_notice = "" if interface is not None else error
         if interface is not None:
             self.manager.attach_hpc(interface)
 
@@ -447,6 +450,8 @@ async def build_runtime(settings: Settings | None = None) -> Runtime:
         hpc=orbit,
         history=history,
     )
+    if orbit is None and orbit_error:
+        manager.hpc_notice = orbit_error
 
     # --- checkpointer ---
     checkpointer = None

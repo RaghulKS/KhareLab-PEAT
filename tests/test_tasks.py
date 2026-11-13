@@ -9,10 +9,16 @@ from pathlib import Path
 
 import pytest
 from designagent.config import Settings
+from designagent.context import TurnContext, current_turn
 from designagent.lake.store import DesignHistory
 from designagent.tasks.base import TaskSpec, TaskState, normalize_state
 from designagent.tasks.hpc.globus import GlobusComputeInterface
-from designagent.tasks.hpc.orbit import OrbitInterface, to_psij_spec
+from designagent.tasks.hpc.orbit import (
+    OrbitInterface,
+    choose_endpoint,
+    resolve_endpoint,
+    to_psij_spec,
+)
 from designagent.tasks.local import LocalTaskInterface, QueryTaskInterface
 from designagent.tasks.manager import TaskManager
 from designagent.tasks.registry import CATALOG
@@ -323,6 +329,144 @@ def test_orbit_never_uses_an_unmatched_endpoint(hint, expected):
         "amarel-1": {"role": "endpoint", "plugins": {"psij": {}}},
     }
     assert OrbitInterface(endpoint=hint)._pick_endpoint(topology) == expected
+
+
+def test_endpoint_mismatch_names_alternatives_and_does_not_substitute():
+    topology = {
+        "broker": {"role": "broker", "plugins": {"psij": {}}},
+        "other-cluster": {"role": "endpoint", "plugins": {"psij": {}}},
+        "amarel-1": {"role": "endpoint", "plugins": {"rhapsody": {}}},
+    }
+    choice = choose_endpoint("amarel3", topology)
+    assert choice.name == ""
+    assert choice.waiting is False
+    assert "amarel3" in choice.notice
+    assert "other-cluster" in choice.notice and "amarel-1" in choice.notice
+    assert "No other endpoint was selected" in choice.notice
+    # A hint that is present, and no hint at all, still select as before.
+    assert choose_endpoint("amarel", topology).name == "amarel-1"
+    assert choose_endpoint("", topology).name == "other-cluster"
+    pending = choose_endpoint("amarel3", {})
+    assert pending.waiting and pending.name == "" and pending.notice == ""
+
+
+async def test_a_known_endpoint_mismatch_does_not_wait_or_substitute():
+    sleeps: list[float] = []
+
+    async def read():
+        return {"other-cluster": {"role": "endpoint", "plugins": {"psij": {}}}}
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    with pytest.raises(RuntimeError, match="amarel3") as raised:
+        await resolve_endpoint(
+            "amarel3", read, timeout=30, clock=lambda: 0.0, sleep=sleep
+        )
+    assert sleeps == []
+    text = str(raised.value)
+    assert "other-cluster" in text
+    assert "No other endpoint was selected" in text
+
+
+async def test_endpoint_resolution_waits_only_while_nothing_is_registered():
+    calls = {"n": 0}
+
+    async def read():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {}
+        return {"amarel-1": {"role": "endpoint", "plugins": {"psij": {}}}}
+
+    now = {"t": 0.0}
+
+    def clock():
+        return now["t"]
+
+    async def sleep(seconds):
+        now["t"] += seconds
+
+    name, _topology = await resolve_endpoint(
+        "amarel", read, timeout=30, clock=clock, sleep=sleep
+    )
+    assert name == "amarel-1"
+    assert calls["n"] == 2
+
+
+async def test_a_missing_endpoint_times_out_naming_what_was_configured():
+    ticks = iter([0.0, 0.0, 30.0])
+
+    async def read():
+        return {"broker": {"role": "broker"}}
+
+    async def sleep(_seconds):
+        return None
+
+    with pytest.raises(RuntimeError, match="amarel3") as raised:
+        await resolve_endpoint(
+            "amarel3",
+            read,
+            timeout=30,
+            clock=lambda: next(ticks),
+            sleep=sleep,
+        )
+    assert "did not register" in str(raised.value)
+    assert "No other endpoint was selected" in str(raised.value)
+
+
+async def test_unconnected_orbit_refuses_a_job_instead_of_picking_an_endpoint():
+    iface = OrbitInterface(endpoint="amarel3")
+    assert iface.connected is False
+    with pytest.raises(RuntimeError, match="not connected"):
+        await iface.submit(TaskSpec(name="proteinmpnn", kind="job", params={}))
+
+
+async def test_hpc_failure_leaves_local_work_running(deps):
+    """A refused endpoint fails only the job that needed it.
+
+    The interface is attached but not connected, which is the state after a
+    mismatch: the manager must settle that submission as FAILED and still run
+    a later local task. Nothing here selects `other-cluster`.
+    """
+    deps.tasks.attach_hpc(OrbitInterface(endpoint="amarel3"))
+    deps.tasks.hpc_notice = choose_endpoint(
+        "amarel3",
+        {"other-cluster": {"role": "endpoint", "plugins": {"psij": {}}}},
+    ).notice
+    records = await deps.tasks.run_many(
+        [
+            TaskSpec(name="proteinmpnn", params={"sequence": "ACDEFGHIK", "_interface": "hpc"}),
+            TaskSpec(
+                name="propose_variants",
+                params={"sequence": "ACDEFGHIK", "n": 1, "_interface": "local"},
+            ),
+        ]
+    )
+    assert records[0]["ok"] is False
+    assert "not connected" in records[0]["error"]
+    assert records[0]["interface"] == "hpc"
+    assert records[1]["ok"] is True
+    assert records[1]["interface"] == "local"
+    assert records[1]["result"]["variants"]
+    assert "other-cluster" in deps.tasks.remote_block_reason()
+
+
+def test_a_users_own_endpoint_does_not_inherit_the_operator_notice(deps):
+    deps.tasks.hpc_notice = "Configured HPC endpoint 'amarel3' is not available."
+    user = TurnContext(
+        user_id="u",
+        username="ada",
+        role="user",
+        settings=deps.settings,
+        hpc_error="Configured HPC endpoint 'ada-queue' is not available.",
+    )
+    token = current_turn.set(user)
+    try:
+        assert "ada-queue" in deps.tasks.remote_block_reason()
+        assert "amarel3" not in deps.tasks.remote_block_reason()
+    finally:
+        current_turn.reset(token)
+    assert "amarel3" in deps.tasks.remote_block_reason()
 
 
 @pytest.mark.parametrize("terminal", [TaskState.DONE, TaskState.FAILED, TaskState.CANCELED])

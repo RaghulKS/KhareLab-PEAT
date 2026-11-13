@@ -920,11 +920,17 @@ def unavailable(ctx: Ctx) -> Outcome | None:
             source="protocol:unavailable:site_unconfigured",
         )
     if not ctx.deps.tasks.hpc_available:
+        # The shared notice names the endpoint that was refused and any
+        # registered alternatives. It is one sentence on this reply, not a
+        # second alert channel.
+        notice = ctx.deps.tasks.remote_block_reason()
+        detail = f" {notice}" if notice else ""
         return Outcome(
             reply=(
                 "No HPC endpoint is attached, so no job was submitted. Every step "
                 "of this protocol runs where the databases, weights and "
                 "environments are — there is no local fallback for it."
+                + detail
             ),
             source="protocol:unavailable:no_endpoint",
         )

@@ -53,6 +53,10 @@ class TaskManager:
         # `hpc` handles belong to two different interfaces, so the name on the
         # handle is not enough to cancel or tail one.
         self._owners: dict[str, TaskInterface] = {}
+        # Why the shared HPC interface is absent. Set when connect refuses an
+        # endpoint; empty when HPC is simply not configured. Shown once on a
+        # round that needed the cluster, not on every chat turn.
+        self.hpc_notice: str = ""
         self._sinks: dict[str, list[EventSink]] = {}
         self._log_drains: list[asyncio.Task] = []
 
@@ -113,6 +117,23 @@ class TaskManager:
     def hpc_available(self) -> bool:
         iface = self._hpc()
         return iface is not None and getattr(iface, "connected", True)
+
+    def remote_block_reason(self) -> str:
+        """Why this turn cannot submit HPC, or "" when there is nothing to say.
+
+        A signed-in user's own endpoint wins over the process-wide notice, and
+        a user who never configured one does not inherit the operator's mismatch.
+        """
+        turn = current_turn.get()
+        if turn is not None:
+            own = turn.hpc
+            if own is not None and getattr(own, "connected", True):
+                return ""
+            if turn.hpc_error:
+                return turn.hpc_error
+            if not turn.use_shared_hpc:
+                return ""
+        return self.hpc_notice
 
     def attach_hpc(self, interface: TaskInterface) -> None:
         """Register a remote interface on a running manager.

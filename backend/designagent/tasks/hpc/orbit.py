@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import replace
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..base import Capabilities, LogChunk, TaskHandle, TaskSpec, TaskState, normalize_state
@@ -27,6 +28,106 @@ from .base import RemoteWorkflowInterface
 log = logging.getLogger(__name__)
 
 TERMINAL = {"DONE", "FAILED", "CANCELED", "CANCELLED", "COMPLETED"}
+
+
+@dataclass(frozen=True)
+class EndpointChoice:
+    """How a configured endpoint matched the broker's current topology.
+
+    `name` is safe to bind. Empty means nothing may be used: `waiting` is the
+    topology still filling in, and `notice` is a definitive mismatch to show
+    the user. A mismatch never names a different endpoint.
+    """
+
+    name: str = ""
+    waiting: bool = False
+    notice: str = ""
+
+
+def _usable_endpoints(topology: dict | None) -> list[str]:
+    names: list[str] = []
+    for name, info in (topology or {}).items():
+        if not isinstance(info, dict) or info.get("role") != "endpoint":
+            continue
+        plugins = info.get("plugins") or {}
+        if {"rhapsody", "psij"} & set(plugins):
+            names.append(str(name))
+    return names
+
+
+def choose_endpoint(hint: str, topology: dict | None) -> EndpointChoice:
+    """Match `hint` to one registered endpoint, or refuse to guess.
+
+    An empty string used to mean both "still waiting" and "the configured name
+    is absent". `connect` treated both as a reason to block until
+    `connect_timeout`, then failed the whole interface with a generic "no
+    endpoint found". That stalled startup and the user's turn even though
+    conversation, local tools, and visualization do not need the cluster. A
+    known mismatch is reported at once and does not bind another cluster.
+    """
+    candidates = _usable_endpoints(topology)
+    hint = (hint or "").strip()
+    if not hint:
+        if candidates:
+            return EndpointChoice(name=candidates[0])
+        return EndpointChoice(waiting=True)
+    for name in candidates:
+        if hint in name:
+            return EndpointChoice(name=name)
+    if not candidates:
+        return EndpointChoice(waiting=True)
+    return EndpointChoice(
+        notice=(
+            f"Configured HPC endpoint {hint!r} is not available. "
+            f"Registered alternatives: {', '.join(candidates)}. "
+            "No other endpoint was selected. Conversation, local tools, "
+            "visualization, and document retrieval continue; only jobs that "
+            "need this endpoint are held."
+        )
+    )
+
+
+def _timeout_message(hint: str, topology: dict | None, timeout: float) -> str:
+    seen = sorted(topology or {})
+    hint = (hint or "").strip()
+    if hint:
+        return (
+            f"Configured HPC endpoint {hint!r} did not register within "
+            f"{timeout:.0f}s (topology: {seen}). No other endpoint was selected. "
+            "Other PEAT work continues; only jobs that need this endpoint are held."
+        )
+    return (
+        "no Orbit endpoint with a rhapsody or psij plugin found "
+        f"(topology: {seen})"
+    )
+
+
+async def resolve_endpoint(
+    hint: str,
+    read_topology: Callable[[], Awaitable[dict | None]],
+    *,
+    timeout: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], Awaitable[None]],
+) -> tuple[str, dict]:
+    """Poll until the hint is usable, a mismatch is known, or time runs out.
+
+    `sleep` runs only while no usable endpoint is visible yet. Once another
+    endpoint is registered and the configured name is not among them, this
+    raises immediately with `choose_endpoint`'s notice.
+    """
+    deadline = clock() + timeout
+    topology: dict = {}
+    while True:
+        topology = await read_topology() or {}
+        choice = choose_endpoint(hint, topology)
+        if choice.name:
+            return choice.name, topology
+        if choice.notice:
+            raise RuntimeError(choice.notice)
+        if clock() >= deadline:
+            raise RuntimeError(_timeout_message(hint, topology, timeout))
+        await sleep(1.0)
 
 # A terminal job event can arrive before the scheduler has flushed the job's
 # output file. Only jobs staging files back wait for it; see `_read_whole_stdout`.
@@ -196,20 +297,23 @@ class OrbitInterface(RemoteWorkflowInterface):
         self._rt = rt
 
         # The broker's topology propagates asynchronously, so an endpoint that
-        # has just registered may not be visible on the first look.
-        topology: dict = {}
-        deadline = asyncio.get_running_loop().time() + self._connect_timeout
-        while True:
-            topology = await asyncio.to_thread(rt.topology)
-            self._endpoint = self._pick_endpoint(topology)
-            if self._endpoint:
-                break
-            if asyncio.get_running_loop().time() >= deadline:
-                raise RuntimeError(
-                    "no Orbit endpoint with a rhapsody or psij plugin found "
-                    f"(topology: {sorted(topology or {})})"
-                )
-            await asyncio.sleep(1.0)
+        # has just registered may not be visible on the first look. A configured
+        # name that is already absent while others are registered does not wait
+        # that out, and does not fall through to a different endpoint.
+        loop = asyncio.get_running_loop()
+        try:
+            self._endpoint, topology = await resolve_endpoint(
+                self._endpoint_hint,
+                lambda: asyncio.to_thread(rt.topology),
+                timeout=self._connect_timeout,
+                clock=loop.time,
+                sleep=asyncio.sleep,
+            )
+        except RuntimeError:
+            # Drop the runtime this attempt started. `_make_orbit` records the
+            # message and leaves chat, local tools, and retrieval running.
+            await self.close()
+            raise
 
         plugins = (topology.get(self._endpoint) or {}).get("plugins") or {}
 
@@ -236,23 +340,8 @@ class OrbitInterface(RemoteWorkflowInterface):
         )
 
     def _pick_endpoint(self, topology: dict) -> str:
-        candidates = [
-            name
-            for name, info in (topology or {}).items()
-            if info.get("role") == "endpoint"
-            and {"rhapsody", "psij"} & set((info.get("plugins") or {}))
-        ]
-        if self._endpoint_hint:
-            for name in candidates:
-                if self._endpoint_hint in name:
-                    return name
-            log.warning(
-                "endpoint hint %r matched nothing; candidates=%s",
-                self._endpoint_hint,
-                candidates,
-            )
-            return ""
-        return candidates[0] if candidates else ""
+        """The endpoint name `choose_endpoint` would bind, or "" to bind none."""
+        return choose_endpoint(self._endpoint_hint, topology).name
 
     async def close(self) -> None:
         for poller in self._pollers.values():

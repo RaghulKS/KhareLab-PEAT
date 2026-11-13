@@ -61,7 +61,12 @@ class RemoteWorkflowInterface(TaskInterface):
         result: Any = None,
         error: str = "",
     ) -> None:
-        """Resolve a handle's future exactly once from a status update."""
+        """Resolve a handle's future exactly once from a status update.
+
+        The done-check has to come before any assignment. A late RUNNING or a
+        second terminal event used to overwrite `handle.state` and then return,
+        so a finished task could be reopened in the UI and in the result record.
+        """
         if handle.future.done():
             return
         handle.state = state

@@ -10,6 +10,7 @@ import {
   newSessionId,
   streamChat,
 } from "./lib/api";
+import { hpcStatusLabel } from "./lib/hpcNotice";
 import type {
   AgentState,
   ChatMessage,
@@ -90,6 +91,9 @@ function Workspace({
   // what /api/me reports; /api/health is the server's.
   const llm = me.auth ? me.llm : (health.llm as boolean | undefined);
   const hpc = me.auth ? me.hpc : (health.hpc as boolean | undefined);
+  // One persistent badge, not a toast on every turn. The text names the
+  // endpoint that was refused when the server has one to name.
+  const hpcNotice = hpcStatusLabel(hpc, me, health.notes as string[] | undefined);
   const openCredentials = () => (me.auth ? setCredentialsOpen(true) : setSettingsOpen(true));
 
   // Restore the session on load, so a refresh keeps the conversation.
@@ -248,14 +252,14 @@ function Workspace({
             </span>
           ) : (
             <button
-              className="badge badge-button"
+              className={hpcNotice ? "badge warn badge-button" : "badge badge-button"}
               title={
-                me.hpc_error ||
+                hpcNotice ||
                 "No HPC endpoint: tasks marked hpc run their local equivalents. Click to configure one."
               }
               onClick={openCredentials}
             >
-              local only
+              {hpcNotice ? "HPC unavailable" : "local only"}
             </button>
           )}
         </span>

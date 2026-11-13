@@ -179,6 +179,13 @@ def make_orchestrator(deps: Deps):
 
         n_variants = plan["n_variants"] if plan else 6
         requested = state.get("requested_mutations") or []
+        # One caveat for this round, not a banner on every later chat turn.
+        # The badge already holds the same text for the session.
+        if not deps.tasks.hpc_available:
+            notice = deps.tasks.remote_block_reason()
+            already = notice in caveats or notice in (state.get("warnings") or [])
+            if notice and not already:
+                caveats.insert(0, notice)
 
         # --- build the worklist ---
         work: list[dict[str, Any]] = []

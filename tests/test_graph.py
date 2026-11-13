@@ -245,6 +245,32 @@ async def test_explicit_mutations_are_applied(app, stub_tools):
     assert out["lead_design"]["mutations"] == ["T55V"]
 
 
+async def test_unavailable_endpoint_notifies_once_and_local_work_continues(app, deps, stub_tools):
+    """A mismatch is a caveat on the round that needed HPC, not a dead session.
+
+    Chat before that round does not repeat the notice. The design round still
+    produces an ensemble from the local proposer, and the reply names the
+    endpoint that was refused.
+    """
+    notice = (
+        "Configured HPC endpoint 'amarel3' is not available. "
+        "Registered alternatives: other-cluster. No other endpoint was selected."
+    )
+    deps.tasks.hpc_notice = notice
+
+    chat = await _send(app, "hello")
+    assert chat["intent"] == "chat"
+    assert "amarel3" not in chat["messages"][-1].content
+
+    design = await _send(app, "redesign 1UBQ for stability")
+    assert design["ensemble"]
+    assert design["reply_source"].startswith("interpreter:")
+    assert "amarel3" in design["messages"][-1].content
+    assert "other-cluster" in design["messages"][-1].content
+    assert deps.tasks.snapshot()
+    assert all(task["interface"] != "hpc" for task in deps.tasks.snapshot())
+
+
 @pytest.mark.parametrize("decision", [
     {"intent": "chat", "goal": 42},
     {"intent": "chat", "pdb_id": {"id": "1UBQ"}},
