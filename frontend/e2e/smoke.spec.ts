@@ -129,6 +129,8 @@ test("a turn renders, and says how it was made", async ({ page }) => {
 test("the settings panel opens and shows no secret", async ({ page }) => {
   const problems = guard(page);
 
+  // App fetches /api/me before it renders. Without this stub the request
+  // leaves the page and the settings test is no longer offline.
   await page.route("**/api/me", async (route) =>
     route.fulfill({ json: { auth: false } }),
   );

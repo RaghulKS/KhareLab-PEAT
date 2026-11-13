@@ -27,6 +27,8 @@ dependencies = [
   "httpx",
   "pydantic>=2",
   "pydantic-settings",
+  # Fernet in auth/credentials.py imports cryptography directly. Leaving it
+  # undeclared meant a clean install failed at the first encrypted credential.
   "cryptography",
   # --- data lake / artifacts ---
   "kuzu",

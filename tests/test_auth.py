@@ -370,6 +370,13 @@ def test_authenticated_approval_to_fake_hpc_results(app_client, stub_tools, reco
     rendered = root.get(markdown["url"])
     assert rendered.status_code == 200
     assert "proteinmpnn" in rendered.text and "hpc" in rendered.text
+    # as_user swaps the one test client's cookie, so this has to be set again
+    # after the owner's read. Another account gets the same 404 as a missing
+    # artifact, not the summary.
+    app_client.as_user("bob")
+    stolen = app_client.get(markdown["url"])
+    assert stolen.status_code == 404
+    assert "proteinmpnn" not in stolen.text
     assert any(f["type"] == "state" and f["state"].get("artifacts") for f in _frames(result))
 
 

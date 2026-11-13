@@ -38,12 +38,18 @@ class ArtifactStore:
         if not self._index_path.exists():
             return {}
         try:
+            # UTF-8 explicitly. The default is the host encoding, so an index
+            # written on one machine failed to load on another, and a corrupt
+            # index must not take the store down with it.
             return json.loads(self._index_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
     def _flush(self) -> None:
         tmp = self._index_path.with_suffix(".json.tmp")
+        # `newline="\n"` as well as UTF-8: write_text otherwise follows
+        # os.linesep, so a summary that round-trips on Linux fails the same
+        # read on Windows, and the charset advertised to the browser is wrong.
         tmp.write_text(json.dumps(self._index, indent=2), encoding="utf-8", newline="\n")
         tmp.replace(self._index_path)
 
