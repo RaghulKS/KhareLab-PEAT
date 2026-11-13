@@ -91,15 +91,47 @@ async def test_workflow_consent_covers_generation_and_later_hpc_folds(deps, hpc,
     assert len(hpc.submitted) == 3, "a new turn reused earlier consent"
 
 
-async def test_generic_agreement_and_cancel_do_not_submit(deps, hpc, stub_tools):
+async def test_discussion_does_not_submit_or_drop_the_proposal(deps, hpc, stub_tools):
+    graph = build_graph(deps, checkpointer=InMemorySaver())
+    proposed = await send(graph, "redesign 1UBQ for stability")
+    digest = proposed["hpc_pending"]["digest"]
+    assert "Planned metric" in proposed["messages"][-1].content
+    assert hpc.submitted == []
+
+    agreed = await send(graph, "yes")
+    assert hpc.submitted == []
+    assert agreed["hpc_pending"]["digest"] == digest
+
+    asked = await send(graph, "what is the lead design?")
+    assert asked["intent"] == "chat"
+    assert hpc.submitted == []
+    assert asked["hpc_pending"]["digest"] == digest
+
+    finished = await send(graph, "approve hpc")
+    assert finished["ensemble"]
+    assert hpc.submitted == ["proteinmpnn", "fold_sequence", "fold_sequence"]
+
+
+async def test_cancel_drops_the_proposal_without_submitting(deps, hpc, stub_tools):
     graph = build_graph(deps, checkpointer=InMemorySaver())
     await send(graph, "redesign 1UBQ for stability")
-    await send(graph, "yes")
-    await send(graph, "approve hpc")
-    assert hpc.submitted == []
-    await send(graph, "run another round")
     canceled = await send(graph, "cancel hpc")
     assert canceled["hpc_pending"] == {}
+    assert hpc.submitted == []
+    await send(graph, "approve hpc")
+    assert hpc.submitted == []
+
+
+async def test_a_question_does_not_request_hpc_approval(deps, hpc, stub_tools):
+    graph = build_graph(deps, checkpointer=InMemorySaver())
+    await send(graph, "load 1UBQ")
+    asked = await send(graph, "what would A42V do?")
+    assert asked["intent"] == "chat"
+    assert not asked.get("hpc_pending")
+    assert hpc.submitted == []
+    looked = await send(graph, "show me the structure")
+    assert looked["intent"] == "visualize"
+    assert not looked.get("hpc_pending")
     assert hpc.submitted == []
 
 

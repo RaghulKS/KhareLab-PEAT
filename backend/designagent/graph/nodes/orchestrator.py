@@ -12,14 +12,15 @@ import uuid
 from typing import Any, Literal
 
 from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from ...llm import complete_json
+from ...llm import complete_json, schema_detail
 from ...tasks.base import TaskSpec
 from ...tasks.jobspec import batch_timeout, job_params
 from ...tasks.registry import CATALOG, describe
 from ...tools.esmfold import ESMATLAS_MAX_LEN, fold_job_spec
 from ...tools.proteinmpnn import mpnn_job_spec, variants_from_mpnn_fasta
+from ..approval import request_approval
 from ..deps import Deps, llm_caveat, status
 from ..state import DesignState
 
@@ -82,6 +83,51 @@ class RoundPlan(BaseModel):
     tasks: list[PlannedTask] | None = None
     n_variants: int = Field(default=6, ge=2, le=12)
     notes: str | None = None
+
+
+def coerce_plan(raw: dict) -> tuple[dict, str]:
+    """Keep the plan fields that validate and name the ones that do not.
+
+    A single bad field used to discard the whole object, so a supported metric
+    or an in-range candidate count never reached the round. Invalid tasks are
+    dropped rather than run. The caveat is the recovery path: the round still
+    proceeds, on rules for whatever was rejected.
+    """
+    try:
+        return RoundPlan.model_validate(raw).model_dump(exclude_none=True), ""
+    except ValidationError as exc:
+        summary = schema_detail(exc)
+
+    kept: dict[str, Any] = {}
+    metric = raw.get("key_metric")
+    if isinstance(metric, dict):
+        try:
+            kept["key_metric"] = PlannedMetric.model_validate(metric).model_dump(
+                exclude_none=True
+            )
+        except ValidationError:
+            pass
+    good: list[dict] = []
+    tasks = raw.get("tasks")
+    if isinstance(tasks, list):
+        for item in tasks:
+            try:
+                good.append(PlannedTask.model_validate(item).model_dump(exclude_none=True))
+            except ValidationError:
+                continue
+    if good:
+        kept["tasks"] = good
+    try:
+        kept["n_variants"] = RoundPlan.model_validate(
+            {"n_variants": raw.get("n_variants", 6)}
+        ).n_variants
+    except ValidationError:
+        kept["n_variants"] = 6
+    note = (
+        "the model's reply did not match the expected schema "
+        f"({summary}); the round continues with the fields that validated"
+    )
+    return kept, note
 
 
 PLAN_SYSTEM = """You plan one round of protein redesign.
@@ -154,14 +200,19 @@ def make_orchestrator(deps: Deps):
         plan: dict[str, Any] | None = None
         caveats: list[str] = []
         if deps.settings.llm_available:
-            plan = await complete_json(
+            raw_plan = await complete_json(
                 PLAN_SYSTEM + "\n\nCatalog:\n" + describe({"local", "query", "hpc"}),
                 _plan_context(state, round_no, parent_sequence),
                 settings=deps.settings,
                 on_fallback=llm_caveat(deps, caveats),
-                schema=RoundPlan,
                 max_tokens=900,
             )
+            # Validated here, not inside complete_json, so one bad field can be
+            # dropped without losing the rest of the plan.
+            if raw_plan:
+                plan, problem = coerce_plan(raw_plan)
+                if problem:
+                    llm_caveat(deps, caveats)(problem)
 
         key_metric = state.get("key_metric") or {}
         if plan and isinstance(plan.get("key_metric"), dict):
@@ -242,6 +293,26 @@ def make_orchestrator(deps: Deps):
                     kind="job" if item["interface"] == "hpc" else "function",
                 )
             )
+
+        if _round_needs_remote(deps, work, parent_sequence):
+            # The plan is known and nothing has been submitted. Consent is for
+            # this remote scope only; a later question can still read the session.
+            preview = (
+                f"Planned metric: {key_metric.get('name') or 'the rule-based metric'}. "
+                f"Candidates this round: {n_variants}. "
+                "Ask about this session if you want to inspect it first; "
+                "remote jobs stay unsubmitted until you reply `approve hpc`."
+            )
+            waiting = request_approval(deps, state, "orchestrator", preview=preview)
+            if waiting is not None:
+                if caveats:
+                    text = waiting.update["messages"][0]["content"]
+                    text += "\n\n**Caveats from this run:**\n" + "\n".join(
+                        f"- {warning}" for warning in dict.fromkeys(caveats)
+                    )
+                    waiting.update["messages"] = [{"role": "assistant", "content": text}]
+                    waiting.update["warnings"] = list(dict.fromkeys(caveats))
+                return waiting
 
         status(f"Generating candidates ({n_variants} requested)…", node="orchestrator")
         records = await deps.tasks.run_many(
@@ -561,6 +632,22 @@ async def _heuristic_fallback(
     if not variants:
         return None
     return {"item": {**item, "status": "done"}, "variants": variants}
+
+
+def _round_needs_remote(deps: Deps, work: list[dict], parent_sequence: str) -> bool:
+    """Whether this round would submit anything off the machine.
+
+    Local generation and a local fold do not need consent. ProteinMPNN, an HPC
+    fold backend, and a sequence too long for the public fold API do.
+    """
+    if any(item.get("interface") == "hpc" for item in work):
+        return True
+    if not deps.tasks.hpc_available:
+        return False
+    configured = deps.settings.fold_backend
+    if configured == "hpc":
+        return True
+    return configured == "esmatlas" and len(parent_sequence) > ESMATLAS_MAX_LEN
 
 
 def _fold_backend(deps: Deps, variants: list[dict]) -> str:

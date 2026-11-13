@@ -72,7 +72,20 @@ def _reply(text: str, **update) -> Command:
     )
 
 
-def request_approval(deps, state: dict, node: str, stage: str = "") -> Command | None:
+def approval_matches(deps, state: dict, node: str, stage: str = "") -> bool:
+    """Whether this checkpoint still holds consent for this exact scope."""
+    approval = state.get("hpc_approval") or {}
+    expected = {
+        "node": node,
+        "stage": stage,
+        "digest": _digest(_scope(deps, state, node, stage)),
+    }
+    return approval == expected
+
+
+def request_approval(
+    deps, state: dict, node: str, stage: str = "", preview: str = ""
+) -> Command | None:
     scope = _scope(deps, state, node, stage)
     pending = {"node": node, "stage": stage, "digest": _digest(scope)}
     if state.get("hpc_approval") == pending:
@@ -110,10 +123,13 @@ def request_approval(deps, state: dict, node: str, stage: str = "") -> Command |
             f"{protocol.get('cat_res') or []}. Selected designs: {protocol.get('designs') or []}. "
             "Approval covers this stage's compute and file transfers only."
         )
-    return _reply(
-        f"HPC approval required. {details}\n\n{site}\n\n"
+    closing = (
         "No job has been submitted for this proposal. Reply `approve hpc` to allow it, "
-        "or `cancel hpc` to cancel this proposal.",
+        "or `cancel hpc` to cancel this proposal."
+    )
+    shown = f"{preview.strip()}\n\n" if preview.strip() else ""
+    return _reply(
+        f"HPC approval required. {details}\n\n{site}\n\n{shown}{closing}",
         hpc_pending=pending,
         hpc_approval={},
     )
@@ -194,16 +210,33 @@ def guard_node(name: str, fn: Callable, deps) -> Callable:
                         return request_approval(deps, state, node, stage)
                     return Command(goto=node, update={"hpc_approval": pending, "hpc_pending": {}})
                 result = await fn(state)
+                update = dict(result.update or {})
+                # Inspection does not submit and does not retire the open
+                # proposal. A design, initialize, or protocol turn does: the
+                # destination asks again for the work it is about to do.
+                intent = str(update.get("intent") or "")
+                if intent in ("chat", "visualize", "summarize"):
+                    update.pop("hpc_pending", None)
+                    update.pop("hpc_approval", None)
+                else:
+                    update["hpc_approval"] = {}
+                    update["hpc_pending"] = {}
                 return Command(
                     goto=result.goto,
                     graph=result.graph,
                     resume=result.resume,
-                    update={**(result.update or {}), "hpc_approval": {}, "hpc_pending": {}},
+                    update=update,
                 )
-            if name == "orchestrator" and deps.tasks.hpc_available:
-                waiting = request_approval(deps, state, name)
-                if waiting:
-                    return waiting
+            # Consent is checked inside the orchestrator, after the plan exists
+            # and only when that plan would submit remote work. Opening the
+            # gate here used to make every design turn — including one that
+            # never leaves the machine — wait on `approve hpc` before the user
+            # could see the plan.
+            if (
+                name == "orchestrator"
+                and deps.tasks.hpc_available
+                and approval_matches(deps, state, name)
+            ):
                 with permit_scope(deps, state, name):
                     result = await fn(state)
             else:

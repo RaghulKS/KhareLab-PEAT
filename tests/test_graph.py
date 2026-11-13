@@ -113,6 +113,7 @@ CASES_WITH_REFERENCE = [
     ("improve solubility", "design"),
     ("propose some variants", "design"),
     ("what mutations did you try?", "chat"),
+    ("what would A42V do?", "chat"),
     ("is the lead design better?", "chat"),
     ("can you redesign it for stability", "design"),
     ("show me the structure", "visualize"),
@@ -289,7 +290,9 @@ async def test_invalid_model_decision_falls_back_visibly(deps, model_reply, deci
 
     assert out.goto == "__end__"
     assert out.update["intent"] == "chat"
-    assert out.update["requested_mutations"] == []
+    # A rejected decision must not install mutations, and a chat turn must not
+    # write an empty list over a mutation request that is already in state.
+    assert out.update.get("requested_mutations", []) == []
     assert out.update["target_hints"] == {}
     assert any("expected schema" in warning for warning in out.update["warnings"])
     assert "expected schema" in out.update["messages"][0]["content"]
@@ -322,6 +325,30 @@ async def test_invalid_model_plan_runs_safe_fallback(deps, stub_tools, model_rep
         "propose_variants", "fold_sequence",
     }
     assert any("expected schema" in warning for warning in out.update["warnings"])
+
+
+async def test_a_bad_metric_keeps_a_valid_candidate_count(deps, stub_tools, model_reply):
+    from designagent.graph.nodes.orchestrator import make_orchestrator
+
+    model_reply["plan"] = {
+        "key_metric": {"name": "invented_measurement"},
+        "n_variants": 4,
+        "tasks": [{"task": "execute_shell"}, {"task": "run_chemgraph", "why": "ligand"}],
+    }
+    out = await make_orchestrator(deps)({
+        **new_state("s"), "goal": "improve solubility",
+        "reference_design": {"sequence": REF_SEQ},
+    })
+
+    assert out.goto == "analyst"
+    assert out.update["key_metric"]["name"] == "mean_hydropathy"
+    generated = next(item for item in out.update["worklist"] if item["task"] == "propose_variants")
+    assert generated["params"]["n"] == 4
+    assert "execute_shell" not in {item["task"] for item in out.update["worklist"]}
+    assert "run_chemgraph" in {item["task"] for item in out.update["worklist"]}
+    warning = " ".join(out.update["warnings"])
+    assert "expected schema" in warning
+    assert "key_metric" in warning
 
 
 async def test_valid_model_decision_and_plan_reach_requested_tool(

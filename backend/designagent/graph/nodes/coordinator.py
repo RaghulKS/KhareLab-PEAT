@@ -189,8 +189,11 @@ def classify_rules(text: str, state: DesignState) -> dict[str, Any]:
         intent = "summarize"
     elif _has_word(low, VIZ_WORDS) and has_reference:
         intent = "visualize"
-    elif is_question and not wants_action and not mutations:
-        # A question about existing results, e.g. "what is the lead design?"
+    elif is_question and not wants_action:
+        # A question about existing results, including one that names a
+        # mutation ("what would A42V do?"). Mentioning a mutation is not a
+        # request to submit it. An action verb still is: "can you redesign
+        # it" carries "redesign" and does not land here.
         intent = "chat"
     elif mutations or wants_action or _has_word(low, DESIGN_NOUNS):
         intent = "initialize" if not has_reference and (pdb_ids or accessions) else "design"
@@ -372,7 +375,10 @@ def make_coordinator(deps: Deps):
             update["goal"] = text
 
         requested = [m for m in (decision.get("mutations") or []) if isinstance(m, str)]
-        update["requested_mutations"] = requested
+        # A chat or view turn must not wipe an explicit mutation list the open
+        # proposal was scoped to, and must not adopt one the user only asked about.
+        if intent in ("design", "initialize"):
+            update["requested_mutations"] = requested
 
         if intent == "chat":
             answer = None

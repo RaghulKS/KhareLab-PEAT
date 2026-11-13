@@ -149,13 +149,41 @@ async def complete_json(
     if parsed is not None and schema is not None:
         try:
             return schema.model_validate(parsed).model_dump(exclude_none=True)
-        except ValidationError:
+        except ValidationError as exc:
+            # Name the field and stop. The input itself stays out of the caveat:
+            # a routing payload is not a secret, but it is also not something to
+            # copy into the checkpoint verbatim.
             if on_fallback:
-                on_fallback("the model's reply did not match the expected schema")
+                on_fallback(schema_failure(exc))
             return None
     if parsed is None and on_fallback:
         on_fallback("the model's reply was not JSON")
     return parsed
+
+
+def schema_detail(exc: ValidationError) -> str:
+    """Field locations from a validation error, without the rejected values."""
+    parts: list[str] = []
+    for err in exc.errors()[:4]:
+        loc = ".".join(str(piece) for piece in err.get("loc", ())) or "response"
+        msg = str(err.get("msg", "invalid")).strip().replace("\n", " ")
+        if len(msg) > 120:
+            msg = msg[:117] + "..."
+        parts.append(f"{loc}: {msg}")
+    return "; ".join(parts) or "response was invalid"
+
+
+def schema_failure(exc: ValidationError) -> str:
+    """A recoverable description of a routing payload that did not validate.
+
+    The turn continues on the rule-based path. The message names the fields so
+    the failure is distinguishable from a missing key, and it does not include
+    the rejected value.
+    """
+    return (
+        "the model's reply did not match the expected schema "
+        f"({schema_detail(exc)}); continuing without that reply"
+    )
 
 
 def describe_error(exc: BaseException) -> str:
